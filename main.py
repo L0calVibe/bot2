@@ -7,85 +7,91 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Ключи подтянутся из настроек Render
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-def get_from_google(lat, lon):
-    """Первый этап: Поиск через Google Places (с рейтингами)"""
+def get_places_google(lat, lon):
+    """Запрос к Google Places API для поиска лучших мест с рейтингом"""
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+    
     params = {
         "location": f"{lat},{lon}",
         "radius": 5000,
+        "type": "tourist_attraction", 
         "key": GOOGLE_API_KEY,
         "language": "ru"
     }
+    
     try:
-        res = requests.get(url, params=params, timeout=10).json()
-        if res.get("status") == "OK":
-            places = []
-            for item in res.get("results", [])[:5]: # Берем ТОП-5 от Google
-                name = item.get("name")
-                rating = item.get("rating", "—")
-                place_id = item.get("place_id")
-                link = f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place_id}"
-                places.append(f"🌟 **{name}**\n⭐ Рейтинг: {rating}\n🔗 [В Google Карты]({link})")
-            return places
-    except:
-        return None
-    return None
-
-def get_from_osm(lat, lon):
-    """Второй этап: Резервный поиск через OpenStreetMap (если Google молчит)"""
-    overpass_url = "http://overpass-api.de/api/interpreter"
-    query = f"""
-    [out:json];
-    (node["tourism"~"museum|viewpoint|attraction"](around:5000,{lat},{lon});
-     node["amenity"~"restaurant|cafe"](around:5000,{lat},{lon}););
-    out center 5;
-    """
-    try:
-        res = requests.get(overpass_url, params={'data': query}, timeout=10).json()
-        places = []
-        for el in res.get('elements', []):
-            name = el.get('tags', {}).get('name')
-            if name:
-                p_lat, p_lon = el.get('lat') or el.get('center', {}).get('lat'), el.get('lon') or el.get('center', {}).get('lon')
-                link = f"https://www.google.com/maps/search/?api=1&query={p_lat},{p_lon}"
-                places.append(f"📍 **{name}** (OSM)\n🔗 [На карту]({link})")
-        return places
-    except:
+        response = requests.get(url, params=params)
+        data = response.json()
+        
+        if data.get("status") != "OK":
+            return None
+        
+        results = []
+        # Берем 10 самых популярных мест
+        for item in data.get("results", [])[:10]:
+            name = item.get("name")
+            rating = item.get("rating", "—")
+            user_ratings = item.get("user_ratings_total", 0)
+            address = item.get("vicinity", "Адрес не указан")
+            
+            # Проверка, открыто ли сейчас
+            opening_hours = item.get("opening_hours", {})
+            status = "✅ Открыто" if opening_hours.get("open_now") else "❌ Сейчас закрыто"
+            
+            place_id = item.get("place_id")
+            # Ссылка на страницу места с отзывами и фото
+            gmaps_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}&query_place_id={place_id}"
+            
+            results.append(
+                f"🏛 **{name}**\n"
+                f"⭐ Рейтинг: {rating} ({user_ratings} отз.)\n"
+                f"🕒 {status}\n"
+                f"📍 {address}\n"
+                f"🔗 [Подробнее в Google Картах]({gmaps_link})"
+            )
+            
+        return results
+    except Exception as e:
+        print(f"Ошибка Google API: {e}")
         return None
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    kb = [[types.KeyboardButton(text="📍 Найти места", request_location=True)]]
-    await message.answer("Привет! Я найду лучшее рядом, используя Google и OSM.", 
-                         reply_markup=types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    kb = [[types.KeyboardButton(text="📍 Найти интересное поблизости", request_location=True)]]
+    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+    
+    await message.answer(
+        "Привет! Я помогу найти лучшие места вокруг тебя (музеи, парки, рестораны).\n\n"
+        "Просто нажми кнопку ниже, чтобы отправить локацию.",
+        reply_markup=keyboard
+    )
 
 @dp.message(F.location)
-async def handle_loc(message: types.Message):
-    lat, lon = message.location.latitude, message.location.longitude
-    msg = await message.answer("🔎 Собираю данные из всех систем...")
+async def handle_location(message: types.Message):
+    lat = message.location.latitude
+    lon = message.location.longitude
     
-    # Сначала пробуем Google
-    google_results = get_from_google(lat, lon)
-    # Затем OSM для массовки
-    osm_results = get_from_osm(lat, lon)
+    wait_msg = await message.answer("📡 Обращаюсь к Google Maps, выбираю лучшее...")
     
-    all_results = (google_results or []) + (osm_results or [])
+    places = get_places_google(lat, lon)
     
-    if not all_results:
-        await msg.edit_text("Ничего не найдено даже в резервной системе. 🤷‍♂️")
+    if not places:
+        await wait_msg.edit_text("Google не нашел ничего подходящего в радиусе 5 км.")
         return
 
-    res_text = "✨ **Вот что удалось найти:**\n\n" + "\n\n".join(all_results[:10])
-    await msg.edit_text(res_text, parse_mode="Markdown", disable_web_page_preview=True)
+    response_text = "🌟 **Топ мест рядом с тобой:**\n\n" + "\n\n───────────────\n\n".join(places)
+    await wait_msg.edit_text(response_text, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True) # Чиним Conflict
+    # Эта строка решает проблему конфликта токена из твоих логов
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
