@@ -7,34 +7,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Берем только токен бота из Environment на Render
 TOKEN = os.getenv("BOT_TOKEN")
-
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-def get_places_free(lat, lon):
-    """Поиск через бесплатный Overpass API (OpenStreetMap)"""
+def get_places_categorized(lat, lon):
     url = "http://overpass-api.de/api/interpreter"
     
-    # Ищем: достопримечательности, парки, кафе и замки в радиусе 5 км
+    # Запрос ищет разные типы объектов
     query = f"""
     [out:json][timeout:25];
     (
-      node["tourism"~"museum|viewpoint|attraction|castle"](around:5000,{lat},{lon});
-      node["amenity"~"restaurant|cafe|cinema"](around:5000,{lat},{lon});
-      node["leisure"~"park"](around:5000,{lat},{lon});
+      node["tourism"~"museum|viewpoint|attraction|gallery|castle"](around:5000,{lat},{lon});
+      node["amenity"~"restaurant|cafe|cinema|theatre|arts_centre"](around:5000,{lat},{lon});
+      node["leisure"~"park|garden|zoo"](around:5000,{lat},{lon});
+      node["historic"](around:5000,{lat},{lon});
     );
-    out center 15;
+    out center 20;
     """
     
     try:
         response = requests.get(url, params={'data': query}, timeout=20)
-        if response.status_code != 200:
-            return None
+        if response.status_code != 200: return None
         
         data = response.json()
-        places = []
+        # Словари для распределения по категориям
+        categories = {
+            "🏛 Культура и история": [],
+            "🌳 Парки и отдых": [],
+            "🍴 Еда и досуг": []
+        }
         
         for element in data.get('elements', []):
             tags = element.get('tags', {})
@@ -43,38 +45,48 @@ def get_places_free(lat, lon):
             
             p_lat = element.get('lat') or element.get('center', {}).get('lat')
             p_lon = element.get('lon') or element.get('center', {}).get('lon')
-            
-            # Ссылка на Google Карты для навигации
             link = f"https://www.google.com/maps?q={p_lat},{p_lon}"
-            places.append(f"📍 **{name}**\n🔗 [Открыть в картах]({link})")
             
-        return places
+            place_info = f"• **{name}**\n  └ [Открыть карту]({link})"
+
+            # Логика распределения по категориям
+            if any(k in tags for k in ["tourism", "historic"]):
+                categories["🏛 Культура и история"].append(place_info)
+            elif any(k in tags for k in ["leisure"]):
+                categories["🌳 Парки и отдых"].append(place_info)
+            elif any(k in tags for k in ["amenity"]):
+                categories["🍴 Еда и досуг"].append(place_info)
+
+        # Формируем итоговый текст
+        final_text = ""
+        for cat_name, items in categories.items():
+            if items:
+                final_text += f"{cat_name}\n" + "\n".join(items[:5]) + "\n\n"
+        
+        return final_text if final_text else "Ничего не найдено рядом."
     except:
         return None
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    kb = [[types.KeyboardButton(text="📍 Найти места поблизости", request_location=True)]]
-    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    await message.answer("Привет! Отправь мне свою локацию, и я найду интересные места рядом (бесплатно и без ключей Google).", reply_markup=keyboard)
+    kb = [[types.KeyboardButton(text="📍 Найти интересное рядом", request_location=True)]]
+    await message.answer("Привет! Нажми кнопку, и я разложу интересные места рядом по полочкам.", 
+                         reply_markup=types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
 
 @dp.message(F.location)
 async def handle_location(message: types.Message):
-    lat = message.location.latitude
-    lon = message.location.longitude
+    wait_msg = await message.answer("🔍 Анализирую карту города...")
     
-    wait_msg = await message.answer("🔍 Ищу интересное рядом...")
-    places = get_places_free(lat, lon)
+    result = get_places_categorized(message.location.latitude, message.location.longitude)
     
-    if not places:
-        await wait_msg.edit_text("Ничего не нашлось. Попробуй нажать кнопку еще раз чуть позже.")
+    if not result:
+        await wait_msg.edit_text("Не удалось получить данные. Попробуй еще раз.")
         return
 
-    res_text = "✨ **Вот что есть в радиусе 5 км:**\n\n" + "\n\n".join(places[:10])
-    await wait_msg.edit_text(res_text, parse_mode="Markdown", disable_web_page_preview=True)
+    await wait_msg.edit_text(f"🌟 **Что есть поблизости:**\n\n{result}", 
+                             parse_mode="Markdown", disable_web_page_preview=True)
 
 async def main():
-    # Эта строка УБИВАЕТ ошибку Conflict из твоих логов
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
