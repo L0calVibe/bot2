@@ -5,7 +5,6 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from dotenv import load_dotenv
 
-# Загружаем ключи из переменных окружения
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("BOT_TOKEN")
@@ -14,94 +13,79 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-def get_places_google(lat, lon):
-    """Запрос к Google Places API для поиска лучших мест поблизости"""
+def get_from_google(lat, lon):
+    """Первый этап: Поиск через Google Places (с рейтингами)"""
     url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-    
     params = {
         "location": f"{lat},{lon}",
         "radius": 5000,
-        # Ищем достопримечательности, чтобы выбор был интересным
-        "type": "tourist_attraction", 
         "key": GOOGLE_API_KEY,
         "language": "ru"
     }
-    
     try:
-        response = requests.get(url, params=params)
-        data = response.json()
-        
-        if data.get("status") != "OK":
-            # Если по достопримечательностям пусто, попробуем поискать заведения
-            params["type"] = "restaurant"
-            response = requests.get(url, params=params)
-            data = response.json()
-            if data.get("status") != "OK":
-                return None
-        
-        results = []
-        # Берем до 10 самых качественных мест
-        for item in data.get("results", [])[:10]:
-            name = item.get("name")
-            rating = item.get("rating", "—")
-            user_ratings = item.get("user_ratings_total", 0)
-            address = item.get("vicinity", "Адрес не указан")
-            
-            # Проверяем статус работы
-            opening_hours = item.get("opening_hours", {})
-            is_open = "✅ Открыто" if opening_hours.get("open_now") else "❌ Сейчас закрыто"
-            
-            # Формируем прямую ссылку на объект в Google
-            place_id = item.get("place_id")
-            gmaps_link = f"https://www.google.com/maps/search/?api=1&query={lat},{lon}&query_place_id={place_id}"
-            
-            # Красивое оформление карточки места
-            card = (
-                f"🏛 **{name}**\n"
-                f"⭐ Рейтинг: {rating} ({user_ratings} отз.)\n"
-                f"🕒 {is_open}\n"
-                f"📍 {address}\n"
-                f"🔗 [Посмотреть фото и отзывы]({gmaps_link})"
-            )
-            results.append(card)
-            
-        return results
-    except Exception as e:
-        print(f"Ошибка Google API: {e}")
+        res = requests.get(url, params=params, timeout=10).json()
+        if res.get("status") == "OK":
+            places = []
+            for item in res.get("results", [])[:5]: # Берем ТОП-5 от Google
+                name = item.get("name")
+                rating = item.get("rating", "—")
+                place_id = item.get("place_id")
+                link = f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place_id}"
+                places.append(f"🌟 **{name}**\n⭐ Рейтинг: {rating}\n🔗 [В Google Карты]({link})")
+            return places
+    except:
+        return None
+    return None
+
+def get_from_osm(lat, lon):
+    """Второй этап: Резервный поиск через OpenStreetMap (если Google молчит)"""
+    overpass_url = "http://overpass-api.de/api/interpreter"
+    query = f"""
+    [out:json];
+    (node["tourism"~"museum|viewpoint|attraction"](around:5000,{lat},{lon});
+     node["amenity"~"restaurant|cafe"](around:5000,{lat},{lon}););
+    out center 5;
+    """
+    try:
+        res = requests.get(overpass_url, params={'data': query}, timeout=10).json()
+        places = []
+        for el in res.get('elements', []):
+            name = el.get('tags', {}).get('name')
+            if name:
+                p_lat, p_lon = el.get('lat') or el.get('center', {}).get('lat'), el.get('lon') or el.get('center', {}).get('lon')
+                link = f"https://www.google.com/maps/search/?api=1&query={p_lat},{p_lon}"
+                places.append(f"📍 **{name}** (OSM)\n🔗 [На карту]({link})")
+        return places
+    except:
         return None
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    # Кнопка с запросом локации
-    kb = [[types.KeyboardButton(text="📍 Найти интересное поблизости", request_location=True)]]
-    keyboard = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    
-    await message.answer(
-        "Привет! Я помогу тебе найти лучшие места для прогулки и отдыха.\n\n"
-        "Нажми кнопку ниже, чтобы отправить свою локацию и получить список топовых мест от Google Maps.",
-        reply_markup=keyboard
-    )
+    kb = [[types.KeyboardButton(text="📍 Найти места", request_location=True)]]
+    await message.answer("Привет! Я найду лучшее рядом, используя Google и OSM.", 
+                         reply_markup=types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
 
 @dp.message(F.location)
-async def handle_location(message: types.Message):
-    lat = message.location.latitude
-    lon = message.location.longitude
+async def handle_loc(message: types.Message):
+    lat, lon = message.location.latitude, message.location.longitude
+    msg = await message.answer("🔎 Собираю данные из всех систем...")
     
-    # Сообщение-статус, чтобы пользователь видел работу бота
-    wait_msg = await message.answer("📡 Подключаюсь к Google Maps, выбираю лучшее...")
+    # Сначала пробуем Google
+    google_results = get_from_google(lat, lon)
+    # Затем OSM для массовки
+    osm_results = get_from_osm(lat, lon)
     
-    places = get_places_google(lat, lon)
+    all_results = (google_results or []) + (osm_results or [])
     
-    if not places:
-        await wait_msg.edit_text("К сожалению, Google не нашел ничего подходящего в радиусе 5 км. Попробуй позже!")
+    if not all_results:
+        await msg.edit_text("Ничего не найдено даже в резервной системе. 🤷‍♂️")
         return
 
-    # Собираем все места в один текст с разделителями
-    final_text = "🌟 **Топ мест рядом с тобой:**\n\n" + "\n\n───────────────\n\n".join(places)
-    
-    await wait_msg.edit_text(final_text, parse_mode="Markdown", disable_web_page_preview=True)
+    res_text = "✨ **Вот что удалось найти:**\n\n" + "\n\n".join(all_results[:10])
+    await msg.edit_text(res_text, parse_mode="Markdown", disable_web_page_preview=True)
 
 async def main():
+    await bot.delete_webhook(drop_pending_updates=True) # Чиним Conflict
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
